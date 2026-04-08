@@ -12,7 +12,6 @@ GitHub Actions 每日自動執行：
   LINE_USER_ID               — Basic settings 裡的 Your user ID (U 開頭)
   GH_PAT                     — GitHub Personal Access Token (contents write)
   GITHUB_REPO                — 自動帶入 (github.repository)
-  TOTAL_CAPITAL_USD           — 總資金，預設 155000
 
 用法：
   python tqqq_signal.py                    # 印出訊號
@@ -45,10 +44,24 @@ GITHUB_TOKEN = os.environ.get("GH_PAT", "")
 GITHUB_REPO  = os.environ.get("GITHUB_REPO", "")
 GITHUB_PATH  = "data/latest_signal.json"
 
-TOTAL_CAPITAL_USD = float(os.environ.get("TOTAL_CAPITAL_USD", "155000"))
+# ── 從 config.json 讀取可變參數（金額、目標波動率等）──
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
-TQQQ_TARGET_VOL = 0.30
-TQQQ_CSP_OTM = 0.85
+def load_config():
+    """讀取 config.json，找不到就用預設值。"""
+    defaults = {"target_vol": 0.30, "csp_otm": 0.85}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                cfg = json.load(f)
+            defaults.update(cfg)
+        except Exception as e:
+            print(f"⚠️  讀取 config.json 失敗，使用預設值: {e}")
+    return defaults
+
+_cfg = load_config()
+TQQQ_TARGET_VOL = _cfg["target_vol"]
+TQQQ_CSP_OTM = _cfg["csp_otm"]
 TQQQ_CSP_PREMIUM_EST = 0.027
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tqqq_state.json")
@@ -61,7 +74,7 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tqqq_stat
 def fetch_data():
     end = datetime.date.today() + datetime.timedelta(days=1)
     start = end - datetime.timedelta(days=400)
-    tickers = ['QQQ', 'TQQQ', 'BOXX', 'GLD']
+    tickers = ['QQQ', 'TQQQ']
     data = yf.download(tickers, start=start.strftime('%Y-%m-%d'),
                        end=end.strftime('%Y-%m-%d'),
                        auto_adjust=True, progress=False)
@@ -104,19 +117,16 @@ def compute_tqqq_signal(closes, state):
     rv20 = tqqq_ret.iloc[-20:].std() * np.sqrt(252)
     tqqq_price = tqqq.iloc[-1]
 
+    # Variant A 倉位比例
     raw_pos = min(1.0, max(0.0, TQQQ_TARGET_VOL / rv20)) if rv20 > 0 else 1.0
     position = raw_pos
     cash_pct = 1 - position
 
-    shares = int((TOTAL_CAPITAL_USD * position) / tqqq_price) if tqqq_price > 0 else 0
-    cash_for_put = TOTAL_CAPITAL_USD * cash_pct
-
-    csp_strike = round(tqqq_price * TQQQ_CSP_OTM, 2)
-    csp_contracts = int(cash_for_put / (csp_strike * 100)) if csp_strike > 0 else 0
-    est_premium = round(tqqq_price * TQQQ_CSP_PREMIUM_EST * max(csp_contracts, 0), 0)
-
-    mom_boxx = closes['BOXX'].iloc[-1] / closes['BOXX'].iloc[-63] - 1 if len(closes) >= 63 else 0
-    mom_gld = closes['GLD'].iloc[-1] / closes['GLD'].iloc[-63] - 1 if len(closes) >= 63 else 0
+    # CSP 建議（通用，不綁資金）
+    csp_strike = round(float(tqqq_price * TQQQ_CSP_OTM), 2)
+    csp_premium_per_share = round(float(tqqq_price * TQQQ_CSP_PREMIUM_EST), 2)
+    # 每 $10,000 閒置現金可賣幾張
+    csp_per_10k = int(10000 / (csp_strike * 100)) if csp_strike > 0 else 0
 
     regime = "🟢 牛市" if above else "🔴 熊市"
 
@@ -125,20 +135,16 @@ def compute_tqqq_signal(closes, state):
         "regime": regime,
         "asset": "TQQQ",
         "position_pct": round(position * 100),
-        "shares": shares,
         "cash_pct": round(cash_pct * 100),
         "tqqq_price": round(float(tqqq_price), 2),
         "qqq_price": round(float(current_price), 2),
         "sma200": round(float(current_sma), 2),
         "qqq_vs_sma": round((current_price / current_sma - 1) * 100, 2),
         "rv20": round(float(rv20 * 100), 1),
-        "capital": TOTAL_CAPITAL_USD,
         "target_vol": TQQQ_TARGET_VOL,
         "csp_strike": csp_strike,
-        "csp_contracts": csp_contracts,
-        "csp_est_premium": float(est_premium),
-        "mom_boxx": round(float(mom_boxx * 100), 2),
-        "mom_gld": round(float(mom_gld * 100), 2),
+        "csp_premium_per_share": csp_premium_per_share,
+        "csp_per_10k": csp_per_10k,
         "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
     }
 
@@ -155,23 +161,23 @@ def format_message(sig, today):
     msg += f"📊 TQQQ 每日訊號 — {today}\n"
     msg += f"{'━' * 28}\n\n"
 
-    msg += f"🇺🇸 TQQQ（Variant A Vol Targeting）\n"
+    msg += f"🇺🇸 TQQQ Variant A Vol Targeting\n"
     msg += f"{sig['regime']}（僅供參考，不影響倉位）\n"
-    msg += f"QQQ ${sig['qqq_price']}（vs SMA200 ${sig['sma200']}，{sig['qqq_vs_sma']:+.1f}%）\n"
-    msg += f"TQQQ 20日波動率：{sig['rv20']:.0f}%\n"
+    msg += f"\nTQQQ ${sig['tqqq_price']} ｜ RV20 {sig['rv20']:.0f}%\n"
+    msg += f"QQQ ${sig['qqq_price']} vs SMA200 ${sig['sma200']}（{sig['qqq_vs_sma']:+.1f}%）\n"
 
-    msg += f"\n🎯 倉位配置（${sig['capital']:,.0f}）：\n"
-    msg += f"  TQQQ {sig['position_pct']}%（{sig['shares']}股 × ${sig['tqqq_price']}）\n"
-    msg += f"  現金 {sig['cash_pct']}%\n"
+    msg += f"\n🎯 建議倉位：\n"
+    msg += f"  TQQQ {sig['position_pct']}% ／ 現金 {sig['cash_pct']}%\n"
+    if sig['cash_pct'] > 5:
+        msg += f"  （現金建議 parking 在 BOXX）\n"
+    msg += f"  （公式：30% ÷ {sig['rv20']:.0f}% = {sig['position_pct']}%）\n"
 
-    if sig.get('csp_contracts', 0) > 0:
-        msg += f"\n💰 CSP 建議：\n"
-        msg += f"  Sell {sig['csp_contracts']}張 TQQQ Put\n"
+    if sig['cash_pct'] > 5:
+        msg += f"\n💰 閒置現金 Sell Put 建議：\n"
         msg += f"  Strike ${sig['csp_strike']}（~15% OTM）\n"
-        msg += f"  月到期，預估權利金 ~${sig['csp_est_premium']:.0f}\n"
+        msg += f"  預估權利金 ~${sig['csp_premium_per_share']}/股\n"
+        msg += f"  每 $10,000 閒置現金 → {sig['csp_per_10k']} 張\n"
 
-    msg += f"\n📊 替代資產動量：\n"
-    msg += f"  BOXX {sig['mom_boxx']:+.1f}% / GLD {sig['mom_gld']:+.1f}%\n"
     msg += f"\n{'━' * 28}"
     return msg
 
@@ -275,13 +281,8 @@ def main():
     parser = argparse.ArgumentParser(description='TQQQ Daily Signal (Variant A)')
     parser.add_argument('--line', action='store_true', help='推送 LINE')
     parser.add_argument('--upload', action='store_true', help='上傳 JSON 到 GitHub')
-    parser.add_argument('--capital', type=float, default=None, help='總資金 USD')
     parser.add_argument('--json', action='store_true', help='輸出 JSON')
     args = parser.parse_args()
-
-    if args.capital:
-        global TOTAL_CAPITAL_USD
-        TOTAL_CAPITAL_USD = args.capital
 
     print("拉取資料中...")
     closes = fetch_data()
