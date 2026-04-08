@@ -1,0 +1,21 @@
+{
+  "date": "2026-04-08",
+  "regime": "🟢 牛市",
+  "asset": "TQQQ",
+  "position_pct": 41,
+  "shares": 1414,
+  "cash_pct": 59,
+  "tqqq_price": 48.03,
+  "qqq_price": 605.95,
+  "sma200": 594.55,
+  "qqq_vs_sma": 1.92,
+  "rv20": 72.9,
+  "capital": 165000.0,
+  "target_vol": 0.3,
+  "csp_strike": 40.82,
+  "csp_contracts": 23,
+  "csp_est_premium": 30.0,
+  "mom_boxx": 0.95,
+  "mom_gld": 6.37,
+  "updated_at": "2026-04-08T17:42:44.126472Z"
+}
