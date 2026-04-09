@@ -1,17 +1,17 @@
 {
-  "date": "2026-04-08",
+  "date": "2026-04-09",
   "regime": "🟢 牛市",
   "asset": "TQQQ",
   "position_pct": 41,
   "cash_pct": 59,
-  "tqqq_price": 48.0,
-  "qqq_price": 606.09,
-  "sma200": 594.55,
-  "qqq_vs_sma": 1.94,
-  "rv20": 72.8,
+  "tqqq_price": 48.96,
+  "qqq_price": 610.19,
+  "sma200": 594.96,
+  "qqq_vs_sma": 2.56,
+  "rv20": 73.1,
   "target_vol": 0.3,
-  "csp_strike": 40.8,
-  "csp_premium_per_share": 1.3,
+  "csp_strike": 41.62,
+  "csp_premium_per_share": 1.32,
   "csp_per_10k": 2,
-  "updated_at": "2026-04-08T23:27:10.558994Z"
+  "updated_at": "2026-04-09T23:28:14.634566Z"
 }
