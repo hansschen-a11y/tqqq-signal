@@ -21,13 +21,11 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install yfinance numpy pandas requests
+        run: pip install yfinance numpy pandas requests scipy
 
       - name: Run TQQQ signal
         env:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
-          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
           GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_REPO: ${{ github.repository }}
-          TOTAL_CAPITAL_USD: ${{ secrets.TOTAL_CAPITAL_USD }}
         run: python tqqq_signal.py --line --upload --json
