@@ -188,25 +188,24 @@ def format_message(sig, today):
 
 def send_line_message(msg):
     """
-    透過 LINE Messaging API push message 發送。
-    文件：https://developers.line.biz/en/reference/messaging-api/#send-push-message
-    免費方案每月 200 則，每日 1 則綽綽有餘。
+    透過 LINE Messaging API broadcast 發送給所有好友。
+    文件：https://developers.line.biz/en/reference/messaging-api/#send-broadcast-message
+    免費方案每月 200 則 broadcast，每日 1 則綽綽有餘。
     """
     import requests
 
-    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
-        print("⚠️  LINE_CHANNEL_ACCESS_TOKEN 或 LINE_USER_ID 未設定")
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        print("⚠️  LINE_CHANNEL_ACCESS_TOKEN 未設定")
         return False
 
     try:
         resp = requests.post(
-            "https://api.line.me/v2/bot/message/push",
+            "https://api.line.me/v2/bot/message/broadcast",
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
             },
             json={
-                "to": LINE_USER_ID,
                 "messages": [
                     {"type": "text", "text": msg}
                 ],
