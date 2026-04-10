@@ -1,0 +1,9 @@
+{
+  "target_vol": 0.25,
+  "csp_target_delta": -0.35,
+  "csp_expiry_days": 30,
+  "iv_premium_mult": 1.15,
+  "tqqq_iv_mult": 3.2,
+  "min_iv": 0.55,
+  "rf_annual": 0.045
+}
