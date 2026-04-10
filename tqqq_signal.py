@@ -140,20 +140,29 @@ def estimate_iv(rv20, vix=None):
 # 資料
 # ═══════════════════════════════════════════════════════════
 
-def fetch_data():
+def fetch_data(retries=3):
+    import time
     end = datetime.date.today() + datetime.timedelta(days=1)
     start = end - datetime.timedelta(days=400)
     tickers = ['QQQ', 'TQQQ', '^VIX']
-    data = yf.download(tickers, start=start.strftime('%Y-%m-%d'),
-                       end=end.strftime('%Y-%m-%d'),
-                       auto_adjust=True, progress=False)
-    if isinstance(data.columns, pd.MultiIndex):
-        closes = data['Close']
-    else:
-        closes = data
-    closes.columns = [c.replace('^', '') for c in closes.columns]
-    closes = closes.ffill().dropna()
-    return closes
+    for attempt in range(retries):
+        try:
+            data = yf.download(tickers, start=start.strftime('%Y-%m-%d'),
+                               end=end.strftime('%Y-%m-%d'),
+                               auto_adjust=True, progress=False)
+            if isinstance(data.columns, pd.MultiIndex):
+                closes = data['Close']
+            else:
+                closes = data
+            closes.columns = [c.replace('^', '') for c in closes.columns]
+            closes = closes.ffill().dropna()
+            if len(closes) > 0 and 'TQQQ' in closes.columns:
+                return closes
+            print(f"⚠️  資料不完整，重試 {attempt+1}/{retries}...")
+        except Exception as e:
+            print(f"⚠️  下載失敗（{e}），重試 {attempt+1}/{retries}...")
+        time.sleep(5)
+    raise RuntimeError("無法下載資料，已重試 3 次")
 
 
 def load_state():
