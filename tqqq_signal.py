@@ -200,7 +200,7 @@ def compute_tqqq_signal(closes, state):
     csp_premium = round(bs_price(tqqq_price, csp_strike, T, RF_ANNUAL, iv, 'put'), 2)
     csp_delta = round(bs_delta(tqqq_price, csp_strike, T, RF_ANNUAL, iv, 'put'), 3)
     csp_otm_pct = round((1 - csp_strike / tqqq_price) * 100, 1)
-    csp_per_10k = int(10000 / (csp_strike * 100)) if csp_strike > 0 else 0
+    csp_margin_2x = round(csp_strike * 2 * 100, 0)  # 2x 覆蓋：每張所需閒置現金
 
     regime = "🟢 牛市" if above else "🔴 熊市"
 
@@ -222,7 +222,7 @@ def compute_tqqq_signal(closes, state):
         "csp_delta": csp_delta,
         "csp_otm_pct": csp_otm_pct,
         "csp_premium": csp_premium,
-        "csp_per_10k": csp_per_10k,
+        "csp_margin_2x": csp_margin_2x,
         "csp_expiry_days": CSP_EXPIRY_DAYS,
         "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
     }
@@ -260,7 +260,7 @@ def format_message(sig, today):
         msg += f"  IV {sig['iv_est']:.0f}%"
         if sig.get('vix'):
             msg += f"（VIX {sig['vix']:.0f}）"
-        msg += f"\n  每 $10,000 閒置現金 → {sig['csp_per_10k']} 張\n"
+        msg += f"\n  每張需 ${sig['csp_margin_2x']:,.0f} 閒置現金（2x 覆蓋）\n"
 
     msg += f"\n{'━' * 28}"
     return msg
