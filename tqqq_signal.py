@@ -260,7 +260,7 @@ def format_message(sig, today):
         msg += f"  IV {sig['iv_est']:.0f}%"
         if sig.get('vix'):
             msg += f"（VIX {sig['vix']:.0f}）"
-        msg += f"\n  每張需 ${sig['csp_margin_2x']:,.0f} 閒置現金（2x 覆蓋）\n"
+        msg += f"\n  閒置現金每 ${sig['csp_margin_2x']:,.0f} 賣一張（2x 覆蓋）\n"
 
     msg += f"\n{'━' * 28}"
     return msg
