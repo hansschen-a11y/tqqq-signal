@@ -4,7 +4,6 @@ on:
   schedule:
     # 美東 16:30（收盤後半小時）
     - cron: '30 20 * * 1-5'   # 夏令 UTC
-    - cron: '30 21 * * 1-5'   # 冬令 UTC
   workflow_dispatch:           # 手動觸發
 
 jobs:
