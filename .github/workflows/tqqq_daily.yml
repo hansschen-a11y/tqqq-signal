@@ -1,30 +1,25 @@
 name: TQQQ Daily Signal
-
 on:
   schedule:
     # 美東 16:30（收盤後半小時）
     - cron: '30 20 * * 1-5'   # 夏令 UTC
   workflow_dispatch:           # 手動觸發
-
 jobs:
   signal:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: pip install yfinance numpy pandas requests scipy
-
       - name: Run TQQQ signal
         env:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_REPO: ${{ github.repository }}
+          TWELVEDATA_API_KEY: ${{ secrets.2facecfed79f44fd8f36d5ea1c024b03 }}
         run: python tqqq_signal.py --line --upload --json
