@@ -50,13 +50,15 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 
 def load_config():
     defaults = {
-        "target_vol": 0.25,
-        "csp_target_delta": -0.35,
+        "target_vol": 0.20,          # FIX: 原本 0.25，與實際部署值不符（silent failure 風險）
+        "csp_target_delta": -0.20,   # FIX: 原本 -0.35，與實際部署值不符
         "csp_expiry_days": 30,
         "iv_premium_mult": 1.15,
         "tqqq_iv_mult": 3.2,
         "min_iv": 0.55,
         "rf_annual": 0.045,
+        "dq_warn_thr": 0.20,         # 單日|報酬|警戒閾值：超過就標記＋在訊息附註
+        "dq_reject_thr": 0.30,       # 單日|log報酬|硬拒絕閾值(約±35%簡單報酬)：暫停推播
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -75,6 +77,8 @@ IV_PREMIUM_MULT    = _cfg["iv_premium_mult"]
 TQQQ_IV_MULT       = _cfg["tqqq_iv_mult"]
 MIN_IV             = _cfg["min_iv"]
 RF_ANNUAL          = _cfg["rf_annual"]
+DQ_WARN_THR        = _cfg.get("dq_warn_thr", 0.20)
+DQ_REJECT_THR      = _cfg.get("dq_reject_thr", 0.30)
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tqqq_state.json")
 
@@ -137,6 +141,87 @@ def estimate_iv(rv20, vix=None):
 
 
 # ═══════════════════════════════════════════════════════════
+# 已實現波動率 + 資料品質檢查
+# ═══════════════════════════════════════════════════════════
+
+def realized_vol(prices, window=20, ann=252, use_log=True):
+    """
+    年化已實現波動率。
+    預設：對數報酬 ln(P_t/P_{t-1})、樣本標準差(ddof=1)、×√252。
+    （與 Barchart 對數定義一致；年化因子統一用 252，模型內部才不會各說各話。）
+    """
+    p = prices.dropna()
+    if len(p) < window + 1:
+        return float('nan')
+    if use_log:
+        r = np.log(p / p.shift(1)).dropna()
+    else:
+        r = p.pct_change().dropna()
+    if len(r) < window:
+        return float('nan')
+    return float(r.iloc[-window:].std(ddof=1) * np.sqrt(ann))
+
+
+def data_quality_report(tqqq, warn_thr=DQ_WARN_THR, reject_thr=DQ_REJECT_THR):
+    """
+    資料品質健檢。回傳 flags 供訊號決定是否照常推播。
+
+    三道防線：
+      1) 硬離群 (hard_reject) —— 單日 |log 報酬| > reject_thr(預設 0.30，約 ±35%
+         簡單報酬)。TQQQ 真實單日極端史上約 -20% 上下；超過此值幾乎必為髒資料
+         (yfinance 壞 print / 調整瑕疵)，直接暫停推播。
+      2) 單點綁架 (single_point_dominated) —— 留一法：把 |報酬| 最大的那一天拿掉
+         後重算 RV20，若原始 RV20 > 去一日版 × 1.25，代表整個 RV20 被『一天』撐起來
+         (今天 100% 就是這型)。真實的連續多日高波動不會因少一天就崩掉，故不誤殺。
+      3) 期限結構參考 (inconsistent_curve) —— RV20 同時 > RV9 且 > RV50 一截，
+         輔助佐證。
+    """
+    logr = np.log(tqqq / tqqq.shift(1)).dropna()
+    last20 = logr.iloc[-20:]
+    if len(last20) < 20:
+        return {"rv9": None, "rv20": None, "rv50": None, "max_abs_ret": None,
+                "worst_date": None, "outliers": {}, "rv20_drop1": None,
+                "hard_reject": False, "single_point_dominated": False,
+                "inconsistent_curve": False, "warn": False}
+
+    abs20 = last20.abs()
+    max_abs = float(abs20.max())
+    worst_date = abs20.idxmax()
+
+    rv9  = realized_vol(tqqq, 9)
+    rv20 = realized_vol(tqqq, 20)
+    rv50 = realized_vol(tqqq, 50)
+
+    # 留一法：拿掉最大絕對值那天，用剩下 19 天算 RV20
+    kept = last20.drop(worst_date)
+    rv20_drop1 = float(kept.std(ddof=1) * np.sqrt(252))
+    single_point_dominated = bool(rv20_drop1 > 0 and rv20 > rv20_drop1 * 1.25)
+
+    inconsistent = bool(
+        not np.isnan(rv9) and not np.isnan(rv50)
+        and rv20 > rv9 * 1.10 and rv20 > rv50 * 1.30
+    )
+
+    outliers = last20[abs20 > warn_thr]
+    hard_reject = bool(max_abs > reject_thr)
+    warn = bool(single_point_dominated or inconsistent or len(outliers) > 0)
+
+    return {
+        "rv9":  round(rv9 * 100, 1)  if not np.isnan(rv9)  else None,
+        "rv20": round(rv20 * 100, 1) if not np.isnan(rv20) else None,
+        "rv50": round(rv50 * 100, 1) if not np.isnan(rv50) else None,
+        "rv20_drop1": round(rv20_drop1 * 100, 1),
+        "max_abs_ret": round(max_abs, 4),
+        "worst_date": worst_date.strftime('%Y-%m-%d'),
+        "outliers": {d.strftime('%Y-%m-%d'): round(float(v), 4) for d, v in outliers.items()},
+        "hard_reject": hard_reject,
+        "single_point_dominated": single_point_dominated,
+        "inconsistent_curve": inconsistent,
+        "warn": warn,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
 # 資料
 # ═══════════════════════════════════════════════════════════
 
@@ -192,8 +277,15 @@ def compute_tqqq_signal(closes, state):
         return {"error": "SMA200 資料不足"}
 
     above = current_price > current_sma
-    tqqq_ret = tqqq.pct_change().dropna()
-    rv20 = tqqq_ret.iloc[-20:].std() * np.sqrt(252)
+
+    # ── 資料品質健檢（log/√252 一致） ──
+    dq = data_quality_report(tqqq)
+    if dq["hard_reject"]:
+        return {"error": (f"資料異常：偵測到單日報酬 {dq['max_abs_ret']:+.1%} "
+                          f"@ {dq['worst_date']}（疑似髒資料），今日暫停推播訊號。"
+                          f"請檢查 yfinance 收盤價後手動重跑。")}
+
+    rv20 = realized_vol(tqqq, 20)   # log/√252，與健檢同一套定義
     tqqq_price = float(tqqq.iloc[-1])
     vix = float(closes['VIX'].iloc[-1]) if 'VIX' in closes.columns else None
 
@@ -224,6 +316,13 @@ def compute_tqqq_signal(closes, state):
         "sma200": round(float(current_sma), 2),
         "qqq_vs_sma": round((current_price / current_sma - 1) * 100, 2),
         "rv20": round(float(rv20 * 100), 1),
+        "rv9": dq["rv9"],
+        "rv50": dq["rv50"],
+        "dq_warn": dq["warn"],
+        "dq_single_point_dominated": dq["single_point_dominated"],
+        "dq_inconsistent_curve": dq["inconsistent_curve"],
+        "dq_max_abs_ret": dq["max_abs_ret"],
+        "dq_rv20_drop1": dq["rv20_drop1"],
         "target_vol": TQQQ_TARGET_VOL,
         "iv_est": round(float(iv * 100), 1),
         "vix": round(float(vix), 1) if vix else None,
@@ -254,6 +353,16 @@ def format_message(sig, today):
     msg += f"🇺🇸 TQQQ Variant A Vol Targeting\n"
     msg += f"{sig['regime']}（僅供參考，不影響倉位）\n"
     msg += f"\nTQQQ ${sig['tqqq_price']} ｜ RV20 {sig['rv20']:.0f}%\n"
+    if sig.get('dq_warn'):
+        parts = []
+        if sig.get('dq_single_point_dominated') and sig.get('dq_rv20_drop1') is not None:
+            parts.append(f"剔除單日離群後 RV20≈{sig['dq_rv20_drop1']:.0f}%")
+        if sig.get('rv9') is not None:
+            parts.append(f"RV9 {sig['rv9']:.0f}%/RV50 {sig['rv50']:.0f}%")
+        if sig.get('dq_max_abs_ret'):
+            parts.append(f"單日最大 {sig['dq_max_abs_ret']*100:+.0f}%")
+        detail = "，".join(parts)
+        msg += f"⚠️ 資料品質提醒：RV20 疑被單一異常日灌高（{detail}），請人工複核收盤價\n"
     msg += f"QQQ ${sig['qqq_price']} vs SMA200 ${sig['sma200']}（{sig['qqq_vs_sma']:+.1f}%）\n"
 
     msg += f"\n🎯 建議倉位：\n"
