@@ -59,6 +59,7 @@ def load_config():
         "rf_annual": 0.045,
         "dq_warn_thr": 0.20,         # 單日|報酬|警戒閾值：超過就標記＋在訊息附註
         "dq_reject_thr": 0.30,       # 單日|log報酬|硬拒絕閾值(約±35%簡單報酬)：暫停推播
+        "dq_track_tol": 0.03,        # TQQQ vs 3×QQQ 單日追蹤誤差警戒(3pp，warn-only)
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -79,6 +80,7 @@ MIN_IV             = _cfg["min_iv"]
 RF_ANNUAL          = _cfg["rf_annual"]
 DQ_WARN_THR        = _cfg.get("dq_warn_thr", 0.20)
 DQ_REJECT_THR      = _cfg.get("dq_reject_thr", 0.30)
+DQ_TRACK_TOL       = _cfg.get("dq_track_tol", 0.03)
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tqqq_state.json")
 
@@ -162,19 +164,23 @@ def realized_vol(prices, window=20, ann=252, use_log=True):
     return float(r.iloc[-window:].std(ddof=1) * np.sqrt(ann))
 
 
-def data_quality_report(tqqq, warn_thr=DQ_WARN_THR, reject_thr=DQ_REJECT_THR):
+def data_quality_report(tqqq, qqq=None, warn_thr=DQ_WARN_THR,
+                        reject_thr=DQ_REJECT_THR, track_tol=DQ_TRACK_TOL):
     """
     資料品質健檢。回傳 flags 供訊號決定是否照常推播。
 
-    三道防線：
+    四道防線（全部 warn-only，唯 hard_reject 會暫停推播）：
       1) 硬離群 (hard_reject) —— 單日 |log 報酬| > reject_thr(預設 0.30，約 ±35%
          簡單報酬)。TQQQ 真實單日極端史上約 -20% 上下；超過此值幾乎必為髒資料
          (yfinance 壞 print / 調整瑕疵)，直接暫停推播。
       2) 單點綁架 (single_point_dominated) —— 留一法：把 |報酬| 最大的那一天拿掉
-         後重算 RV20，若原始 RV20 > 去一日版 × 1.25，代表整個 RV20 被『一天』撐起來
-         (今天 100% 就是這型)。真實的連續多日高波動不會因少一天就崩掉，故不誤殺。
-      3) 期限結構參考 (inconsistent_curve) —— RV20 同時 > RV9 且 > RV50 一截，
-         輔助佐證。
+         後重算 RV20，若原始 RV20 > 去一日版 × 1.25，代表整個 RV20 被『一天』撐起來。
+         真實的連續多日高波動不會因少一天就崩掉，故不誤殺。
+      3) 期限結構參考 (inconsistent_curve) —— RV20 同時 > RV9 且 > RV50 一截，輔助佐證。
+      4) 追蹤誤差 (tracking_error) —— TQQQ 單日報酬應 ≈ 3×QQQ 單日報酬(每日重置)。
+         若某日 |TQQQ_ret − 3×QQQ_ret| > track_tol(預設 3pp)，代表 TQQQ 那天的收盤價
+         與底層 QQQ 對不上 —— 可抓 ffill 假 0%、調整因子多日漂移、單點髒 print。
+         乾淨資料實測日追蹤誤差 <1pp，故 3pp 幾乎不誤報。需傳入 qqq 才會啟用。
     """
     logr = np.log(tqqq / tqqq.shift(1)).dropna()
     last20 = logr.iloc[-20:]
@@ -182,7 +188,8 @@ def data_quality_report(tqqq, warn_thr=DQ_WARN_THR, reject_thr=DQ_REJECT_THR):
         return {"rv9": None, "rv20": None, "rv50": None, "max_abs_ret": None,
                 "worst_date": None, "outliers": {}, "rv20_drop1": None,
                 "hard_reject": False, "single_point_dominated": False,
-                "inconsistent_curve": False, "warn": False}
+                "inconsistent_curve": False, "track_max_resid": None,
+                "track_n_bad": 0, "track_worst_date": None, "warn": False}
 
     abs20 = last20.abs()
     max_abs = float(abs20.max())
@@ -204,7 +211,26 @@ def data_quality_report(tqqq, warn_thr=DQ_WARN_THR, reject_thr=DQ_REJECT_THR):
 
     outliers = last20[abs20 > warn_thr]
     hard_reject = bool(max_abs > reject_thr)
-    warn = bool(single_point_dominated or inconsistent or len(outliers) > 0)
+
+    # ── 追蹤誤差檢查：TQQQ 單日報酬 ≈ 3×QQQ 單日報酬 ──
+    track_max_resid = None
+    track_n_bad = 0
+    track_worst_date = None
+    if qqq is not None:
+        qr = qqq.pct_change()
+        tr = tqqq.pct_change()
+        pair = pd.concat([qr, tr], axis=1, keys=['q', 't']).dropna().iloc[-20:]
+        if len(pair) >= 5:
+            resid = (pair['t'] - 3.0 * pair['q']).abs()
+            track_max_resid = round(float(resid.max()), 4)
+            bad = resid[resid > track_tol]
+            track_n_bad = int(len(bad))
+            if track_n_bad > 0:
+                track_worst_date = resid.idxmax().strftime('%Y-%m-%d')
+
+    tracking_flag = bool(track_n_bad > 0)
+    warn = bool(single_point_dominated or inconsistent
+                or len(outliers) > 0 or tracking_flag)
 
     return {
         "rv9":  round(rv9 * 100, 1)  if not np.isnan(rv9)  else None,
@@ -217,6 +243,9 @@ def data_quality_report(tqqq, warn_thr=DQ_WARN_THR, reject_thr=DQ_REJECT_THR):
         "hard_reject": hard_reject,
         "single_point_dominated": single_point_dominated,
         "inconsistent_curve": inconsistent,
+        "track_max_resid": track_max_resid,
+        "track_n_bad": track_n_bad,
+        "track_worst_date": track_worst_date,
         "warn": warn,
     }
 
@@ -278,8 +307,8 @@ def compute_tqqq_signal(closes, state):
 
     above = current_price > current_sma
 
-    # ── 資料品質健檢（log/√252 一致） ──
-    dq = data_quality_report(tqqq)
+    # ── 資料品質健檢（log/√252 一致；含 3×QQQ 追蹤檢查） ──
+    dq = data_quality_report(tqqq, qqq)
     if dq["hard_reject"]:
         return {"error": (f"資料異常：偵測到單日報酬 {dq['max_abs_ret']:+.1%} "
                           f"@ {dq['worst_date']}（疑似髒資料），今日暫停推播訊號。"
@@ -323,6 +352,9 @@ def compute_tqqq_signal(closes, state):
         "dq_inconsistent_curve": dq["inconsistent_curve"],
         "dq_max_abs_ret": dq["max_abs_ret"],
         "dq_rv20_drop1": dq["rv20_drop1"],
+        "dq_track_max_resid": dq["track_max_resid"],
+        "dq_track_n_bad": dq["track_n_bad"],
+        "dq_track_worst_date": dq["track_worst_date"],
         "target_vol": TQQQ_TARGET_VOL,
         "iv_est": round(float(iv * 100), 1),
         "vix": round(float(vix), 1) if vix else None,
@@ -361,6 +393,8 @@ def format_message(sig, today):
             parts.append(f"RV9 {sig['rv9']:.0f}%/RV50 {sig['rv50']:.0f}%")
         if sig.get('dq_max_abs_ret'):
             parts.append(f"單日最大 {sig['dq_max_abs_ret']*100:+.0f}%")
+        if sig.get('dq_track_n_bad'):
+            parts.append(f"{sig['dq_track_n_bad']}天偏離3×QQQ(最差@{sig.get('dq_track_worst_date')})")
         detail = "，".join(parts)
         msg += f"⚠️ 資料品質提醒：RV20 疑被單一異常日灌高（{detail}），請人工複核收盤價\n"
     msg += f"QQQ ${sig['qqq_price']} vs SMA200 ${sig['sma200']}（{sig['qqq_vs_sma']:+.1f}%）\n"
