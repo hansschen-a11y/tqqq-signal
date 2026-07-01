@@ -315,18 +315,56 @@ def _halt_payload(msg, review=None, date=None):
 # 第二來源覆核（自動化人工複核）
 # ═══════════════════════════════════════════════════════════
 
-def fetch_reference_closes(days=45, ticker="tqqq.us", timeout=12):
+# 第二來源符號對照（中性符號 → 各供應商符號）
+_REF_SYMBOLS = {
+    "TQQQ": {"td": "TQQQ", "stooq": "tqqq.us"},
+    "QQQ":  {"td": "QQQ",  "stooq": "qqq.us"},
+    "VIX":  {"td": "VIX",  "stooq": "^vix"},
+}
+
+
+def _fetch_twelvedata(symbol, days, timeout):
     """
-    從 Stooq 抓 TQQQ 日收盤價當『第二獨立來源』（yfinance 之外）。
-    回傳 pd.Series(close, index=DatetimeIndex) 或 None（任何失敗都回 None，絕不拋例外）。
-    注意：此沙盒連不到 Stooq，需在 GitHub Actions runner 上實測；
-    抓不到時 auto_review 會判定 'unavailable' → 自動退回 warn-only，不影響推播。
+    Twelve Data /time_series → pd.Series(close) 或 None。
+    需環境變數 TWELVEDATA_API_KEY；沒設 key、額度用盡、symbol 不支援都回 None。
     """
+    key = os.environ.get("TWELVEDATA_API_KEY", "")
+    if not key:
+        return None
+    try:
+        import requests
+        td_sym = _REF_SYMBOLS.get(symbol, {}).get("td", symbol)
+        outputsize = min(5000, int(days * 2 + 10))
+        resp = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params={"symbol": td_sym, "interval": "1day",
+                    "outputsize": outputsize, "apikey": key, "format": "JSON"},
+            timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        j = resp.json()
+        if not isinstance(j, dict) or j.get("status") == "error" or "values" not in j:
+            return None                      # 額度用盡/symbol 不支援 → 退回 fallback
+        vals = j["values"]
+        if not vals or len(vals) < 10:
+            return None
+        closes = {pd.to_datetime(v["datetime"]): float(v["close"])
+                  for v in vals if v.get("close") not in (None, "")}
+        s = pd.Series(closes).sort_index().dropna()
+        return s if len(s) >= 10 else None
+    except Exception as e:
+        print(f"⚠️  Twelve Data 抓取失敗，改用 fallback：{e}")
+        return None
+
+
+def _fetch_stooq(symbol, days, timeout):
+    """Stooq CSV → pd.Series(close) 或 None（fallback；runner 上常被擋）。"""
     try:
         import requests, io
+        stq = _REF_SYMBOLS.get(symbol, {}).get("stooq", symbol)
         end = _us_today()
         start = end - datetime.timedelta(days=int(days * 2 + 10))
-        url = (f"https://stooq.com/q/d/l/?s={ticker}"
+        url = (f"https://stooq.com/q/d/l/?s={stq}"
                f"&d1={start.strftime('%Y%m%d')}&d2={end.strftime('%Y%m%d')}&i=d")
         resp = requests.get(url, timeout=timeout,
                             headers={"User-Agent": "Mozilla/5.0"})
@@ -339,8 +377,20 @@ def fetch_reference_closes(days=45, ticker="tqqq.us", timeout=12):
                       index=pd.to_datetime(df["Date"])).sort_index().dropna()
         return s if len(s) >= 10 else None
     except Exception as e:
-        print(f"⚠️  第二來源(Stooq)抓取失敗，退回 warn-only：{e}")
+        print(f"⚠️  Stooq 抓取失敗：{e}")
         return None
+
+
+def fetch_reference_closes(days=45, symbol="TQQQ", timeout=12):
+    """
+    第二獨立來源（yfinance 之外）日收盤，供交叉驗證與 stale backfill。
+    來源順序：Twelve Data（有 TWELVEDATA_API_KEY 時，雲端可用）→ Stooq（fallback）。
+    任何失敗都回 None，絕不拋例外；全失敗時 auto_review 判 'unavailable' → 退回 warn-only。
+    """
+    s = _fetch_twelvedata(symbol, days, timeout)
+    if s is not None:
+        return s
+    return _fetch_stooq(symbol, days, timeout)
 
 
 def auto_review(tqqq_yf, qqq, dq, ref_closes=None, tol=REF_TOL,
@@ -579,8 +629,8 @@ def compute_tqqq_signal(closes, state):
     bf_capped = False
     if stale_flag and AUTO_CORRECT and ref_closes is not None:
         refs = {"TQQQ": ref_closes,
-                "QQQ": fetch_reference_closes(ticker="qqq.us"),
-                "VIX": fetch_reference_closes(ticker="^vix")}
+                "QQQ": fetch_reference_closes(symbol="QQQ"),
+                "VIX": fetch_reference_closes(symbol="VIX")}
         closes_bf, backfilled, bf_carried, bf_capped = backfill_frame(
             closes, refs, MAX_BACKFILL_DAYS)
         if backfilled:
@@ -737,7 +787,7 @@ def format_message(sig, today):
     msg += f"\nTQQQ ${sig['tqqq_price']} ｜ RV20 {sig['rv20']:.0f}%\n"
     if sig.get('backfilled_dates'):
         carry = f"（{'/'.join(sig['backfill_carried'])} 無第二來源，仍以 yfinance 舊值計）" if sig.get('backfill_carried') else ""
-        msg += f"🔧 yfinance 延遲，已用 Stooq 補整組資料最新日：{'、'.join(sig['backfilled_dates'])}{carry}\n"
+        msg += f"🔧 yfinance 延遲，已用第二來源補整組資料最新日：{'、'.join(sig['backfilled_dates'])}{carry}\n"
     elif sig.get('backfill_capped'):
         msg += f"⚠️ yfinance 延遲超過 {sig.get('data_busday_gap','?')} 營業日（超過自動補值上限），未自動補，請人工複核\n"
     if sig.get('dq_stale') or sig.get('dq_ffill_tail'):
@@ -748,7 +798,7 @@ def format_message(sig, today):
             bits.append(f"{'/'.join(sig['dq_ffill_tail'])} 最新值疑為 ffill")
         if sig.get('ref_latest_date') and sig.get('yf_latest_date') \
                 and sig['ref_latest_date'] > sig['yf_latest_date'] and not sig.get('backfilled_dates'):
-            bits.append(f"yfinance 最新 {sig['yf_latest_date']} vs Stooq 最新 {sig['ref_latest_date']}（yfinance 延遲）")
+            bits.append(f"yfinance 最新 {sig['yf_latest_date']} vs 第二來源最新 {sig['ref_latest_date']}（yfinance 延遲）")
         rv = sig.get('review_verdict', 'skipped')
         rnote = {"clean": "，第二來源重疊日一致", "corrected": "，已依第二來源修正",
                  "ambiguous": "，第二來源覆核不確定", "unavailable": "，第二來源不可用"}.get(rv, "")
