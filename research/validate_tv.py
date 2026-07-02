@@ -180,6 +180,26 @@ def main():
     print(f"\n  ★ 總結：{n_pass}/4 PASS "
           f"{'→ GO：tv=0.20 通過描述性驗證' if n_pass == 4 else '→ NO-GO 或需討論'}")
 
+    # ── 對照實驗（v2 追加；明確標註為 post-hoc，用於解讀 G4，不改判準本身）──
+    print("\n" + "=" * 64)
+    print("  對照實驗（post-hoc，v2 追加）")
+    print("=" * 64)
+    print("  C1：已驗基準 tv=0.30 是否也過不了同一個 G4？")
+    lo30, med30, hi30 = stationary_bootstrap_sharpe_diff(results[0.30]['dr'], spy_dr)
+    print(f"     Sharpe(0.30)−Sharpe(SPY) 95% CI = [{lo30:+.3f}, {hi30:+.3f}]"
+          f"（中位 {med30:+.3f}）→ {'PASS' if lo30 > 0 else 'FAIL'}")
+    if lo30 <= 0:
+        print("     → 已驗基準同樣 FAIL：G4 反映的是 11.5 年資料的統計檢定力上限，")
+        print("       非 tv=0.20 特有的缺陷。")
+    print("\n  C2：0.20 與 0.30 的 Sharpe 差可否與 0 區分？（成對比較）")
+    lo23, med23, hi23 = stationary_bootstrap_sharpe_diff(
+        results[0.20]['dr'], results[0.30]['dr'])
+    print(f"     Sharpe(0.20)−Sharpe(0.30) 95% CI = [{lo23:+.3f}, {hi23:+.3f}]"
+          f"（中位 {med23:+.3f}）")
+    if lo23 <= 0 <= hi23:
+        print("     → CI 跨 0：兩者風險調整報酬統計上不可區分，")
+        print("       tv 的選擇是純風險偏好，量化上成立。")
+
     # ── 資訊項：0.20 相對 0.30 的代價 ──
     m30 = results[0.30]['m']
     print("\n" + "=" * 64)
