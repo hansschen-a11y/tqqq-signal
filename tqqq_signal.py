@@ -616,12 +616,29 @@ def compute_tqqq_signal(closes, state):
     # ── 資料品質健檢（log/√252 一致；含 3×QQQ 追蹤檢查） ──
     dq = data_quality_report(tqqq, qqq)
 
-    # 需要覆核時才抓一次第二來源（供 backfill 與 auto_review 共用）
+    # 第二來源：每天都抓（canary）。出事日拿來覆核/backfill；平常日驗證備援活著且一致，
+    # 避免「災難日才第一次測試備援」。抓不到不影響訊號（warn-only）。
     need_review = bool(dq["warn"] or dq["hard_reject"] or stale_flag)
-    ref_closes = fetch_reference_closes() if (need_review and AUTO_REVIEW) else None
+    ref_closes = fetch_reference_closes() if AUTO_REVIEW else None
     yf_latest = tqqq.index[-1].strftime('%Y-%m-%d')
     ref_latest = (ref_closes.index[-1].strftime('%Y-%m-%d')
                   if ref_closes is not None and len(ref_closes) else None)
+
+    # ── canary 健康判定（純診斷，不改任何決策）──
+    if ref_closes is None:
+        canary = "unavailable"          # 備援掛了：今天就知道，不是等災難日
+    else:
+        try:
+            common = tqqq.index.intersection(ref_closes.index)
+            if len(common) >= 2:
+                d_last, d_prev = common[-1], common[-2]
+                r_yf = float(tqqq.loc[d_last] / tqqq.loc[d_prev] - 1.0)
+                r_rf = float(ref_closes.loc[d_last] / ref_closes.loc[d_prev] - 1.0)
+                canary = "ok" if abs(r_yf - r_rf) <= REF_TOL else "mismatch"
+            else:
+                canary = "no_overlap"
+        except Exception:
+            canary = "error"
 
     # ── 資料層①：stale 且 Stooq 有更新 → 自動補最新日（整個 frame；auto_correct 控制）──
     backfilled = []
@@ -749,6 +766,7 @@ def compute_tqqq_signal(closes, state):
         "backfill_capped": bf_capped,
         "ref_latest_date": ref_latest,
         "yf_latest_date": yf_latest,
+        "ref_canary": canary,
         "shadow_decision": shadow,
         "decision_applied": decision_applied,
         "dq_stale": bool(fresh["stale"]),
@@ -785,6 +803,11 @@ def format_message(sig, today):
     msg += f"🇺🇸 TQQQ Variant A Vol Targeting\n"
     msg += f"{sig['regime']}（僅供參考，不影響倉位）\n"
     msg += f"\nTQQQ ${sig['tqqq_price']} ｜ RV20 {sig['rv20']:.0f}%\n"
+    if sig.get('ref_canary') in ('unavailable', 'mismatch', 'error'):
+        note = {"unavailable": "第二來源今日抓不到（備援失效，出事日將無交叉驗證）",
+                "mismatch": "第二來源與 yfinance 最新日報酬不一致",
+                "error": "第二來源 canary 檢查出錯"}[sig['ref_canary']]
+        msg += f"🩺 {note}，請留意\n"
     if sig.get('backfilled_dates'):
         carry = f"（{'/'.join(sig['backfill_carried'])} 無第二來源，仍以 yfinance 舊值計）" if sig.get('backfill_carried') else ""
         msg += f"🔧 yfinance 延遲，已用第二來源補整組資料最新日：{'、'.join(sig['backfilled_dates'])}{carry}\n"
@@ -967,7 +990,7 @@ def main():
 
     save_state(state)
 
-    msg = format_message(sig, today)
+    msg = format_message(sig, sig.get('date', today))   # backfill 日以補後日期為準
     print(msg)
 
     if args.json:
