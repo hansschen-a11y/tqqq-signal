@@ -1,8 +1,9 @@
 name: TQQQ Daily Signal
 on:
   schedule:
-    - cron: '30 20 * * 1-5'
-  workflow_dispatch:
+    # 21:30 UTC：夏令=美東17:30、冬令=美東16:30，全年都在收盤後
+    - cron: '30 21 * * 1-5'
+  workflow_dispatch:           # 手動觸發
 jobs:
   signal:
     runs-on: ubuntu-latest
@@ -15,6 +16,8 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: pip install yfinance numpy pandas requests scipy
+      - name: Run tests (gate)
+        run: python tests/test_signal.py
       - name: Run TQQQ signal
         env:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
