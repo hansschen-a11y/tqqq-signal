@@ -51,7 +51,7 @@ def macro_regime_line() -> str:
                 stale = f"⚠️已{(now - cov_d).days}天未更新"
         except Exception:
             pass
-        line = f"\n—\n🌐 總經(izaax): {stance}｜{phase}"
+        line = f"\n—\n🌐 總經: {stance}｜{phase}"
         if flags:
             line += f"｜旗標: {flags}"
         line += f"（至{cov}{stale}，僅供參考不計分）"
