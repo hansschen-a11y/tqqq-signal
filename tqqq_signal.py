@@ -991,6 +991,12 @@ def main():
     save_state(state)
 
     msg = format_message(sig, sig.get('date', today))   # backfill 日以補後日期為準
+    # izaax 總經定調（顯示層，不參與訊號/倉位；讀不到就靜默跳過）— 2026-07-11
+    try:
+        from macro_display_patch import macro_regime_line
+        msg += macro_regime_line()
+    except Exception:
+        pass
     print(msg)
 
     if args.json:
