@@ -40,6 +40,9 @@ import yfinance as yf
 # ═══════════════════════════════════════════════════════════
 
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+# 2026-07-22: 有 LINE_USER_ID 時改用 push API（只寄給自己，1 則/天）；
+# 沒有時 fallback 到 broadcast（寄給全部好友，N 則/天，吃額度快）
+LINE_USER_ID = os.environ.get("LINE_USER_ID", "")
 
 GITHUB_TOKEN = os.environ.get("GH_PAT", "")
 GITHUB_REPO  = os.environ.get("GITHUB_REPO", "")
@@ -893,18 +896,22 @@ def send_line_message(msg):
         print("⚠️  LINE_CHANNEL_ACCESS_TOKEN 未設定")
         return False
 
+    # 2026-07-22: 優先用 push（省額度）；未設 LINE_USER_ID 才用 broadcast
+    if LINE_USER_ID:
+        url = "https://api.line.me/v2/bot/message/push"
+        payload = {"to": LINE_USER_ID, "messages": [{"type": "text", "text": msg}]}
+    else:
+        url = "https://api.line.me/v2/bot/message/broadcast"
+        payload = {"messages": [{"type": "text", "text": msg}]}
+
     try:
         resp = requests.post(
-            "https://api.line.me/v2/bot/message/broadcast",
+            url,
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
             },
-            json={
-                "messages": [
-                    {"type": "text", "text": msg}
-                ],
-            },
+            json=payload,
             timeout=10,
         )
         if resp.status_code == 200:
@@ -1002,14 +1009,24 @@ def main():
     if args.json:
         print("\n" + json.dumps(sig, indent=2, ensure_ascii=False, default=str))
 
+    # 2026-07-22: 推播/上傳失敗改為 exit 1，讓 GitHub Actions 變紅並寄失敗通知
+    # （原本靜默失敗，LINE 額度用完 10 天沒人發現）
+    failed = []
+
+    if args.upload:
+        if not upload_to_github(sig):
+            failed.append("GitHub 上傳")
+
     if args.line:
         if send_line_message(msg):
             print("\n✅ LINE 已發送")
         else:
             print("\n❌ LINE 發送失敗")
+            failed.append("LINE 推播")
 
-    if args.upload:
-        upload_to_github(sig)
+    if failed:
+        print(f"\n💥 發送階段失敗: {', '.join(failed)} — 以非零狀態結束讓 CI 報警")
+        sys.exit(1)
 
 
 if __name__ == '__main__':

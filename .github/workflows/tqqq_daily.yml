@@ -4,6 +4,9 @@ on:
     # 21:30 UTC：夏令=美東17:30、冬令=美東16:30，全年都在收盤後
     - cron: '30 21 * * 1-5'
   workflow_dispatch:           # 手動觸發
+permissions:
+  contents: write              # 2026-07-22: 改用內建 GITHUB_TOKEN 上傳 latest_signal.json（原 GH_PAT 已過期 401）
+  issues: write                # LINE 推播失敗時開 Issue 備援通知（GitHub 會寄 email）
 jobs:
   signal:
     runs-on: ubuntu-latest
@@ -21,7 +24,24 @@ jobs:
       - name: Run TQQQ signal
         env:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
-          GH_PAT: ${{ secrets.GH_PAT }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}   # 2026-07-22: 改 push 給自己，省額度
+          GH_PAT: ${{ secrets.GITHUB_TOKEN }}         # 2026-07-22: 原 GH_PAT secret 已過期，改用內建 token
           GITHUB_REPO: ${{ github.repository }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
-        run: python tqqq_signal.py --line --upload --json
+        run: |
+          set -o pipefail
+          python tqqq_signal.py --line --upload --json | tee signal_output.log
+      - name: LINE 失敗時開 Issue 備援（email 通知）
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ -f signal_output.log ] || exit 0
+          if grep -q "LINE 發送失敗" signal_output.log; then
+            TITLE="📊 TQQQ 每日訊號（LINE 備援）$(date -u '+%Y-%m-%d')"
+            BODY=$(sed -n '/📊 TQQQ 每日訊號/,/^{/p' signal_output.log | sed '$d')
+            [ -z "$BODY" ] && BODY=$(head -60 signal_output.log)
+            ERR=$(grep "LINE API 回應" signal_output.log || echo "見 Actions log")
+            printf '%s\n\n> ⚠️ LINE 推播失敗：%s\n' "$BODY" "$ERR" | \
+              gh issue create --title "$TITLE" --body-file - || true
+          fi
