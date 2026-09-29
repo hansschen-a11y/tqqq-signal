@@ -19,6 +19,14 @@ CSP strike 使用 Black-Scholes 計算 delta -0.35 的 put strike。
   python tqqq_signal.py --line             # 推送 LINE
   python tqqq_signal.py --upload           # 上傳 JSON 到 GitHub
   python tqqq_signal.py --line --upload    # 兩個都做
+
+2026-09-29 修正（ffill 假日期事件，詳見 claude/incident_20260929_ffill_tail.md）：
+  1. fetch_data：QQQ/TQQQ 任一 NaN 的列直接丟棄，只對 VIX ffill。
+     原本 closes.ffill() 會把前一日價格複製成一個「假的最新交易日」，
+     導致 backfill_frame 認為沒有缺日、auto_review 被 0%=3×0% 騙過、日期標籤錯。
+  2. auto_review：yf 與 QQQ 日報酬同時精確為 0 視為 ffill 指紋，不算「貼 3×QQQ」。
+  3. compute_shadow_decision / single_point_dominated：worst_date 若通過 3×QQQ
+     tracking check（真實行情），禁止用 rv20_drop1 剔除；槓桿 ETF 的 ±8% 是常態。
 """
 
 import argparse
@@ -40,8 +48,8 @@ import yfinance as yf
 # ═══════════════════════════════════════════════════════════
 
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-# 2026-07-22: 有 LINE_USER_ID 時改用 push API（只寄給自己，1 則/天）；
-# 沒有時 fallback 到 broadcast（寄給全部好友，N 則/天，吃額度快）
+# 2026-07-22: broadcast（寄給所有好友）優先；額度不足被 429 擋時，
+# fallback 用 push API 至少寄給自己（LINE_USER_ID，1 則額度）
 LINE_USER_ID = os.environ.get("LINE_USER_ID", "")
 
 GITHUB_TOKEN = os.environ.get("GH_PAT", "")
@@ -98,6 +106,9 @@ REF_TOL            = _cfg.get("ref_tol", 0.03)
 MAX_BACKFILL_DAYS  = _cfg.get("max_backfill_days", 2)
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tqqq_state.json")
+
+# 主 ticker：這兩個缺值不得 ffill（會製造假交易日）；其餘（VIX）允許 ffill
+MAIN_TICKERS = ("QQQ", "TQQQ")
 
 
 def _us_today():
@@ -200,11 +211,15 @@ def data_quality_report(tqqq, qqq=None, warn_thr=DQ_WARN_THR,
       2) 單點綁架 (single_point_dominated) —— 留一法：把 |報酬| 最大的那一天拿掉
          後重算 RV20，若原始 RV20 > 去一日版 × 1.25，代表整個 RV20 被『一天』撐起來。
          真實的連續多日高波動不會因少一天就崩掉，故不誤殺。
+         2026-09-29：worst_date 若通過 3×QQQ 追蹤檢查（真實行情），不再標記
+         single_point_dominated —— 槓桿 ETF 的單日 ±8% 是常態，不是髒資料。
       3) 期限結構參考 (inconsistent_curve) —— RV20 同時 > RV9 且 > RV50 一截，輔助佐證。
       4) 追蹤誤差 (tracking_error) —— TQQQ 單日報酬應 ≈ 3×QQQ 單日報酬(每日重置)。
          若某日 |TQQQ_ret − 3×QQQ_ret| > track_tol(預設 3pp)，代表 TQQQ 那天的收盤價
          與底層 QQQ 對不上 —— 可抓 ffill 假 0%、調整因子多日漂移、單點髒 print。
          乾淨資料實測日追蹤誤差 <1pp，故 3pp 幾乎不誤報。需傳入 qqq 才會啟用。
+         注意：QQQ 與 TQQQ 同時被 ffill 時兩邊都是 0%，此檢查會被騙過 ——
+         所以 fetch_data 必須先把主 ticker 缺值的列丟掉，不得 ffill。
     """
     logr = np.log(tqqq / tqqq.shift(1)).dropna()
     last20 = logr.iloc[-20:]
@@ -212,6 +227,7 @@ def data_quality_report(tqqq, qqq=None, warn_thr=DQ_WARN_THR,
         return {"rv9": None, "rv20": None, "rv50": None, "max_abs_ret": None,
                 "worst_date": None, "outliers": {}, "rv20_drop1": None,
                 "hard_reject": False, "single_point_dominated": False,
+                "worst_date_tracks_qqq": None,
                 "inconsistent_curve": False, "track_max_resid": None,
                 "track_n_bad": 0, "track_worst_date": None, "warn": False}
 
@@ -226,7 +242,7 @@ def data_quality_report(tqqq, qqq=None, warn_thr=DQ_WARN_THR,
     # 留一法：拿掉最大絕對值那天，用剩下 19 天算 RV20
     kept = last20.drop(worst_date)
     rv20_drop1 = float(kept.std(ddof=1) * np.sqrt(252))
-    single_point_dominated = bool(rv20_drop1 > 0 and rv20 > rv20_drop1 * 1.25)
+    dominated_raw = bool(rv20_drop1 > 0 and rv20 > rv20_drop1 * 1.25)
 
     inconsistent = bool(
         not np.isnan(rv9) and not np.isnan(rv50)
@@ -240,6 +256,7 @@ def data_quality_report(tqqq, qqq=None, warn_thr=DQ_WARN_THR,
     track_max_resid = None
     track_n_bad = 0
     track_worst_date = None
+    worst_tracks = None          # worst_date 是否通過 3×QQQ 檢查（None = 無 QQQ 可比）
     if qqq is not None:
         qr = qqq.pct_change()
         tr = tqqq.pct_change()
@@ -251,6 +268,11 @@ def data_quality_report(tqqq, qqq=None, warn_thr=DQ_WARN_THR,
             track_n_bad = int(len(bad))
             if track_n_bad > 0:
                 track_worst_date = resid.idxmax().strftime('%Y-%m-%d')
+            if worst_date in resid.index:
+                worst_tracks = bool(resid.loc[worst_date] <= track_tol)
+
+    # worst_date 貼 3×QQQ → 真實行情，不算「單點綁架」
+    single_point_dominated = bool(dominated_raw and worst_tracks is not True)
 
     tracking_flag = bool(track_n_bad > 0)
     warn = bool(single_point_dominated or inconsistent
@@ -263,6 +285,7 @@ def data_quality_report(tqqq, qqq=None, warn_thr=DQ_WARN_THR,
         "rv20_drop1": round(rv20_drop1 * 100, 1),
         "max_abs_ret": round(max_abs, 4),
         "worst_date": worst_date.strftime('%Y-%m-%d'),
+        "worst_date_tracks_qqq": worst_tracks,
         "outliers": {d.strftime('%Y-%m-%d'): round(float(v), 4) for d, v in outliers.items()},
         "hard_reject": hard_reject,
         "single_point_dominated": single_point_dominated,
@@ -274,12 +297,13 @@ def data_quality_report(tqqq, qqq=None, warn_thr=DQ_WARN_THR,
     }
 
 
-def freshness_check(closes, main_tickers=('QQQ', 'TQQQ'), max_business_gap=2):
+def freshness_check(closes, main_tickers=MAIN_TICKERS, max_business_gap=2):
     """
     資料新鮮度檢查（warn-only → needs_review）。補 tracking check 抓不到的兩種情況：
       - stale：最新交易日距今超過 max_business_gap 個營業日 → 疑資料源多日延遲/中斷。
       - ffill_tail：任一主 ticker 最新收盤與前一日『完全相同』→ ffill 指紋
-        (TQQQ 幾乎不可能真的 0.0000% 日報酬)。
+        (TQQQ 幾乎不可能真的 0.0000% 日報酬)。fetch_data 已不再 ffill 主 ticker，
+        此檢查保留做最後一道防線（yfinance 自己回傳重複值時仍抓得到）。
     局限：單一交易日的整體延遲需 NYSE 行事曆才能精準判定，此處用營業日 gap 近似（backlog）。
     """
     info = {"stale": False, "ffill_tail": [], "latest_date": None, "busday_gap": None}
@@ -298,6 +322,28 @@ def freshness_check(closes, main_tickers=('QQQ', 'TQQQ'), max_business_gap=2):
             if float(closes[tk].iloc[-1]) == float(closes[tk].iloc[-2]):
                 info["ffill_tail"].append(tk)
     return info
+
+
+def drop_ffill_tail(closes, main_tickers=MAIN_TICKERS):
+    """
+    把尾端『主 ticker 全部與前一日完全相同』的列砍掉（ffill 指紋），
+    讓 closes.index[-1] 回到最後一個真實交易日，backfill_frame 才找得到缺日。
+    只砍尾端連續的假列，最多砍到剩 2 列。回傳 (closes, dropped_dates)。
+    """
+    dropped = []
+    if closes is None or len(closes) < 3:
+        return closes, dropped
+    cols = [c for c in main_tickers if c in closes.columns]
+    if not cols:
+        return closes, dropped
+    while len(closes) >= 3:
+        last, prev = closes.iloc[-1], closes.iloc[-2]
+        if all(float(last[c]) == float(prev[c]) for c in cols):
+            dropped.append(closes.index[-1].strftime("%Y-%m-%d"))
+            closes = closes.iloc[:-1]
+        else:
+            break
+    return closes, dropped
 
 
 def _halt_payload(msg, review=None, date=None):
@@ -412,6 +458,8 @@ def auto_review(tqqq_yf, qqq, dq, ref_closes=None, tol=REF_TOL,
 
     第 4 點防呆：只修『Stooq 分歧 ∩ 偏離 3×QQQ』的交集。拆股/配息調整基準不同造成的
     假分歧，yfinance 那天仍會貼 3×QQQ(拆股不改經濟報酬)，故不會被誤修。
+    2026-09-29：yf 日報酬與 QQQ 日報酬『同時精確為 0』是雙 ffill 指紋，不是真的貼
+    3×QQQ —— 這種日子視為可修正（correctable），不再誤判 ambiguous。
     """
     if ref_closes is None:
         ref_closes = fetch_reference_closes()
@@ -438,8 +486,12 @@ def auto_review(tqqq_yf, qqq, dq, ref_closes=None, tol=REF_TOL,
 
     # 交集：同時偏離 3×QQQ 才算 yfinance 真髒（排除調整基準假分歧）
     if q_ret is not None:
-        track_resid = (pair["yf"] - 3.0 * q_ret.reindex(pair.index)).abs()
-        correctable = ref_bad.index[track_resid.reindex(ref_bad.index) > track_tol]
+        q_on = q_ret.reindex(pair.index)
+        track_resid = (pair["yf"] - 3.0 * q_on).abs()
+        # 雙 ffill 指紋：yf 與 QQQ 同日皆精確 0% → 0 = 3×0 是假的一致
+        both_zero = (pair["yf"] == 0.0) & (q_on == 0.0)
+        mask = (track_resid.reindex(ref_bad.index) > track_tol) | both_zero.reindex(ref_bad.index)
+        correctable = ref_bad.index[mask.fillna(False)]
     else:
         correctable = ref_bad.index
 
@@ -509,7 +561,7 @@ def backfill_frame(closes, refs, max_days=2):
                     r = float(s.iloc[loc] / s.iloc[loc - 1] - 1.0)
                     row[col] = prev * (1.0 + r)
                     continue
-            if col in ("QQQ", "TQQQ"):     # 主 ticker 補不了 → 放棄整段
+            if col in MAIN_TICKERS:        # 主 ticker 補不了 → 放棄整段
                 ok = False
                 break
             row[col] = prev                # VIX 等：carry forward
@@ -526,11 +578,25 @@ def compute_shadow_decision(tqqq, dq, review):
     決策層 dry-run：對 ambiguous / hard_reject 這種目前『交給人』的情況，
     計算『若全自動會怎麼處置』的影子決策供觀察，但預設不執行（AUTO_DECIDE 控制）。
     回傳 dict(action, rv20, position_pct, detail) 或 None。
+
+    2026-09-29：worst_date 通過 3×QQQ 追蹤檢查（dq['worst_date_tracks_qqq'] is True）
+    時，禁止 use_rv20_drop1 —— 那是真實行情（例：2026-09-21 TQQQ +8.3% = 3×QQQ +2.77%），
+    剔掉會把倉位灌高（本例 43%→54%）。此時影子決策改為 keep_rv20（照原 RV20）。
     """
     v = review.get("verdict")
     action = None
     shadow_rv20 = None
     detail = ""
+    worst_is_real = dq.get("worst_date_tracks_qqq") is True
+
+    def _drop1_or_keep(reason):
+        if worst_is_real:
+            return ("keep_rv20", realized_vol(tqqq, 20),
+                    f"{reason}，但最大波動日貼 3×QQQ 屬真實行情，不剔除，維持原 RV20")
+        return ("use_rv20_drop1",
+                (dq["rv20_drop1"] / 100.0) if dq.get("rv20_drop1") else None,
+                f"{reason} → 全自動會用剔除離群後 RV20(rv20_drop1)")
+
     if dq["hard_reject"]:
         if v == "clean":
             action = "proceed_de_risk"
@@ -541,13 +607,9 @@ def compute_shadow_decision(tqqq, dq, review):
             shadow_rv20 = realized_vol(review["corrected_tqqq"], 20)
             detail = "全自動會用第二來源修正後重算"
         else:
-            action = "use_rv20_drop1"
-            shadow_rv20 = (dq["rv20_drop1"] / 100.0) if dq.get("rv20_drop1") else None
-            detail = "無法交叉驗證 → 全自動會用剔除離群後 RV20(rv20_drop1)"
+            action, shadow_rv20, detail = _drop1_or_keep("無法交叉驗證")
     elif v == "ambiguous":
-        action = "use_rv20_drop1"
-        shadow_rv20 = (dq["rv20_drop1"] / 100.0) if dq.get("rv20_drop1") else None
-        detail = "多日分歧無法自動判定 → 全自動會用剔除離群後 RV20(rv20_drop1)"
+        action, shadow_rv20, detail = _drop1_or_keep("多日分歧無法自動判定")
     if action is None or not shadow_rv20 or shadow_rv20 <= 0:
         return None
     pos = min(1.0, max(0.0, TQQQ_TARGET_VOL / shadow_rv20))
@@ -559,6 +621,25 @@ def compute_shadow_decision(tqqq, dq, review):
 # 資料
 # ═══════════════════════════════════════════════════════════
 
+def clean_closes(closes):
+    """
+    2026-09-29：取代原本的 closes.ffill().dropna()。
+      - 主 ticker(QQQ/TQQQ) 任一為 NaN 的列 → 整列丟棄（不得 ffill，否則製造假交易日：
+        日期是今天、價格是昨天，backfill 找不到缺日、3×QQQ 檢查被 0=3×0 騙過）。
+      - 其餘欄位(VIX) → 允許 ffill（VIX 常晚出/缺值，只影響 iv 下限）。
+    """
+    if isinstance(closes.columns, pd.MultiIndex):
+        closes = closes['Close']
+    closes = closes.copy()
+    closes.columns = [c.replace('^', '') for c in closes.columns]
+    main = [c for c in MAIN_TICKERS if c in closes.columns]
+    closes = closes.dropna(subset=main)
+    other = [c for c in closes.columns if c not in main]
+    if other:
+        closes[other] = closes[other].ffill()
+    return closes.dropna()
+
+
 def fetch_data(retries=3):
     import time
     end = _us_today() + datetime.timedelta(days=1)
@@ -569,12 +650,7 @@ def fetch_data(retries=3):
             data = yf.download(tickers, start=start.strftime('%Y-%m-%d'),
                                end=end.strftime('%Y-%m-%d'),
                                auto_adjust=True, progress=False)
-            if isinstance(data.columns, pd.MultiIndex):
-                closes = data['Close']
-            else:
-                closes = data
-            closes.columns = [c.replace('^', '') for c in closes.columns]
-            closes = closes.ffill().dropna()
+            closes = clean_closes(data)
             if len(closes) > 0 and 'TQQQ' in closes.columns:
                 return closes
             print(f"⚠️  資料不完整，重試 {attempt+1}/{retries}...")
@@ -601,6 +677,9 @@ def save_state(state):
 # ═══════════════════════════════════════════════════════════
 
 def compute_tqqq_signal(closes, state):
+    # ── 最後一道防線：yfinance 自己回傳重複收盤（ffill 指紋）→ 砍尾，讓 backfill 能補 ──
+    closes, ffill_dropped = drop_ffill_tail(closes)
+
     qqq = closes['QQQ']
     tqqq = closes['TQQQ']
     sma200 = qqq.rolling(200).mean()
@@ -614,7 +693,7 @@ def compute_tqqq_signal(closes, state):
 
     # ── 資料新鮮度檢查（stale / ffill 尾巴）──
     fresh = freshness_check(closes)
-    stale_flag = bool(fresh["stale"] or len(fresh["ffill_tail"]) > 0)
+    stale_flag = bool(fresh["stale"] or len(fresh["ffill_tail"]) > 0 or ffill_dropped)
 
     # ── 資料品質健檢（log/√252 一致；含 3×QQQ 追蹤檢查） ──
     dq = data_quality_report(tqqq, qqq)
@@ -643,11 +722,14 @@ def compute_tqqq_signal(closes, state):
         except Exception:
             canary = "error"
 
-    # ── 資料層①：stale 且 Stooq 有更新 → 自動補最新日（整個 frame；auto_correct 控制）──
+    # ── 資料層①：yfinance 落後第二來源 → 自動補最新日（整個 frame；auto_correct 控制）──
+    #    2026-09-29：不再只看 stale_flag；只要第二來源比 yfinance 新就嘗試補（1 個交易日的
+    #    延遲 busday_gap 抓不到，但 ref_latest > yf_latest 抓得到）。
     backfilled = []
     bf_carried = []
     bf_capped = False
-    if stale_flag and AUTO_CORRECT and ref_closes is not None:
+    ref_newer = bool(ref_latest and ref_latest > yf_latest)
+    if (stale_flag or ref_newer) and AUTO_CORRECT and ref_closes is not None:
         refs = {"TQQQ": ref_closes,
                 "QQQ": fetch_reference_closes(symbol="QQQ"),
                 "VIX": fetch_reference_closes(symbol="VIX")}
@@ -664,6 +746,7 @@ def compute_tqqq_signal(closes, state):
             dq = data_quality_report(tqqq, qqq)             # 補後重新健檢
             fresh = freshness_check(closes)                 # 補後重新評估新鮮度
             stale_flag = bool(fresh["stale"] or len(fresh["ffill_tail"]) > 0)
+            need_review = bool(dq["warn"] or dq["hard_reject"] or stale_flag)
 
     # ── 自動覆核：warn / hard_reject / 新鮮度 都用第二來源自我核對 ──
     review = {"verdict": "skipped", "detail": "", "bad_dates": {}}
@@ -715,7 +798,7 @@ def compute_tqqq_signal(closes, state):
     else:
         data_status = "ok"
     # backfill 後 stale_flag 已重算：若仍 stale（含未補成、capped、QQQ ffill）→ needs_review
-    if (stale_flag or bf_capped) and data_status in (
+    if (stale_flag or bf_capped or (ref_newer and not backfilled)) and data_status in (
             "ok", "ok_corrected", "ok_backfilled", "ok_auto_decided"):
         data_status = "needs_review"
 
@@ -754,6 +837,8 @@ def compute_tqqq_signal(closes, state):
         "rv50": dq["rv50"],
         "dq_warn": dq["warn"],
         "dq_single_point_dominated": dq["single_point_dominated"],
+        "dq_worst_date": dq["worst_date"],
+        "dq_worst_date_tracks_qqq": dq["worst_date_tracks_qqq"],
         "dq_inconsistent_curve": dq["inconsistent_curve"],
         "dq_max_abs_ret": dq["max_abs_ret"],
         "dq_rv20_drop1": dq["rv20_drop1"],
@@ -767,6 +852,7 @@ def compute_tqqq_signal(closes, state):
         "backfilled_dates": backfilled,
         "backfill_carried": bf_carried,
         "backfill_capped": bf_capped,
+        "ffill_dropped_dates": ffill_dropped,
         "ref_latest_date": ref_latest,
         "yf_latest_date": yf_latest,
         "ref_canary": canary,
@@ -811,20 +897,24 @@ def format_message(sig, today):
                 "mismatch": "第二來源與 yfinance 最新日報酬不一致",
                 "error": "第二來源 canary 檢查出錯"}[sig['ref_canary']]
         msg += f"🩺 {note}，請留意\n"
+    if sig.get('ffill_dropped_dates'):
+        msg += f"🧹 yfinance 回傳重複收盤（ffill 指紋），已剔除假交易日：{'、'.join(sig['ffill_dropped_dates'])}\n"
     if sig.get('backfilled_dates'):
         carry = f"（{'/'.join(sig['backfill_carried'])} 無第二來源，仍以 yfinance 舊值計）" if sig.get('backfill_carried') else ""
         msg += f"🔧 yfinance 延遲，已用第二來源補整組資料最新日：{'、'.join(sig['backfilled_dates'])}{carry}\n"
     elif sig.get('backfill_capped'):
         msg += f"⚠️ yfinance 延遲超過 {sig.get('data_busday_gap','?')} 營業日（超過自動補值上限），未自動補，請人工複核\n"
-    if sig.get('dq_stale') or sig.get('dq_ffill_tail'):
+    ref_newer = (sig.get('ref_latest_date') and sig.get('yf_latest_date')
+                 and sig['ref_latest_date'] > sig['yf_latest_date']
+                 and not sig.get('backfilled_dates'))
+    if sig.get('dq_stale') or sig.get('dq_ffill_tail') or ref_newer:
         bits = []
         if sig.get('dq_stale'):
             bits.append(f"最新資料 {sig.get('data_latest_date')}（距今 {sig.get('data_busday_gap')} 營業日）")
         if sig.get('dq_ffill_tail'):
             bits.append(f"{'/'.join(sig['dq_ffill_tail'])} 最新值疑為 ffill")
-        if sig.get('ref_latest_date') and sig.get('yf_latest_date') \
-                and sig['ref_latest_date'] > sig['yf_latest_date'] and not sig.get('backfilled_dates'):
-            bits.append(f"yfinance 最新 {sig['yf_latest_date']} vs 第二來源最新 {sig['ref_latest_date']}（yfinance 延遲）")
+        if ref_newer:
+            bits.append(f"yfinance 最新 {sig['yf_latest_date']} vs 第二來源最新 {sig['ref_latest_date']}（yfinance 延遲，未能自動補）")
         rv = sig.get('review_verdict', 'skipped')
         rnote = {"clean": "，第二來源重疊日一致", "corrected": "，已依第二來源修正",
                  "ambiguous": "，第二來源覆核不確定", "unavailable": "，第二來源不可用"}.get(rv, "")
@@ -838,7 +928,8 @@ def format_message(sig, today):
     if sig.get('rv9') is not None:
         parts.append(f"RV9 {sig['rv9']:.0f}%/RV50 {sig['rv50']:.0f}%")
     if sig.get('dq_max_abs_ret'):
-        parts.append(f"單日最大 {sig['dq_max_abs_ret']*100:+.0f}%")
+        tag = "，貼 3×QQQ 屬真實行情" if sig.get('dq_worst_date_tracks_qqq') else ""
+        parts.append(f"單日最大 {sig['dq_max_abs_ret']*100:+.0f}% @ {sig.get('dq_worst_date','')}{tag}")
     if sig.get('dq_track_n_bad'):
         parts.append(f"{sig['dq_track_n_bad']}天偏離3×QQQ")
     detail = "，".join(parts)
@@ -896,32 +987,36 @@ def send_line_message(msg):
         print("⚠️  LINE_CHANNEL_ACCESS_TOKEN 未設定")
         return False
 
-    # 2026-07-22: 優先用 push（省額度）；未設 LINE_USER_ID 才用 broadcast
-    if LINE_USER_ID:
-        url = "https://api.line.me/v2/bot/message/push"
-        payload = {"to": LINE_USER_ID, "messages": [{"type": "text", "text": msg}]}
-    else:
-        url = "https://api.line.me/v2/bot/message/broadcast"
-        payload = {"messages": [{"type": "text", "text": msg}]}
+    # 2026-07-22: broadcast 給所有好友；失敗（如月額度不足 429）時
+    # fallback push 給自己（LINE_USER_ID），至少本人不漏訊號
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+    }
+    messages = [{"type": "text", "text": msg}]
 
-    try:
-        resp = requests.post(
-            url,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-            },
-            json=payload,
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            return True
-        else:
+    def _post(url, payload):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=10)
+            if resp.status_code == 200:
+                return True
             print(f"⚠️  LINE API 回應: {resp.status_code} {resp.text}")
             return False
-    except Exception as e:
-        print(f"❌ LINE API 錯誤: {e}")
-        return False
+        except Exception as e:
+            print(f"❌ LINE API 錯誤: {e}")
+            return False
+
+    if _post("https://api.line.me/v2/bot/message/broadcast", {"messages": messages}):
+        return True
+
+    if LINE_USER_ID:
+        print("↩️  broadcast 失敗，改 push 給自己（fallback）")
+        if _post("https://api.line.me/v2/bot/message/push",
+                 {"to": LINE_USER_ID, "messages": messages}):
+            print("✅ fallback push 成功（僅本人收到，好友未收到）")
+            return True
+
+    return False
 
 
 # ═══════════════════════════════════════════════════════════

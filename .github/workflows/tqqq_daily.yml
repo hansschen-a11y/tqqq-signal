@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: pip install yfinance numpy pandas requests scipy
       - name: Run tests (gate)
-        run: python tests/test_signal.py
+        run: python tests/test_signal.py && python tests/test_ffill_fix.py
       - name: Run TQQQ signal
         env:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}

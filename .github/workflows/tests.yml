@@ -19,4 +19,4 @@ jobs:
       - name: Install dependencies
         run: pip install yfinance numpy pandas requests scipy
       - name: Run tests
-        run: python tests/test_signal.py
+        run: python tests/test_signal.py && python tests/test_ffill_fix.py
