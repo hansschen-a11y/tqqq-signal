@@ -37,15 +37,15 @@
   "dq_stale": false,
   "dq_ffill_tail": [],
   "data_latest_date": "2026-11-25",
-  "data_busday_gap": 0,
+  "data_busday_gap": 1,
   "target_vol": 0.2,
   "iv_est": 159.0,
-  "vix": 27.9,
+  "vix": 28.3,
   "csp_strike": 34.36,
   "csp_delta": -0.2,
   "csp_otm_pct": 24.1,
   "csp_premium": 2.92,
   "csp_margin_2x": 6872.0,
   "csp_expiry_days": 30,
-  "updated_at": "2026-11-25T21:19:30.512277Z"
+  "updated_at": "2026-11-26T08:33:25.010210Z"
 }
